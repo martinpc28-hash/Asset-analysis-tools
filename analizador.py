@@ -81,8 +81,26 @@ def cargar_serie(ruta: str) -> pd.DataFrame:
     return df
 
 
+def _nombre_largo_yahoo(ticker: str) -> str:
+    """Devuelve el nombre largo del activo en Yahoo Finance, o '' si falla.
+
+    Acorta nombres muy largos para que no rompan las leyendas (max ~40 chars).
+    """
+    try:
+        import yfinance as yf
+        info = yf.Ticker(ticker).info
+        nombre = info.get("longName") or info.get("shortName") or ""
+        if nombre and len(nombre) > 40:
+            nombre = nombre[:38].rstrip() + "..."
+        return nombre
+    except Exception:
+        return ""
+
+
 def cargar_benchmark(ticker: str, start: str, end: str | None) -> pd.Series:
-    """Descarga el benchmark (default S&P 500) desde Yahoo Finance."""
+    """Descarga la serie de cierre de un ticker Yahoo y le pone como nombre
+    'TICKER (Nombre completo)' para que aparezca asi en leyendas y tablas.
+    """
     try:
         import yfinance as yf
     except ImportError as e:
@@ -94,10 +112,15 @@ def cargar_benchmark(ticker: str, start: str, end: str | None) -> pd.Series:
     data = yf.download(ticker, start=start, end=end, progress=False, auto_adjust=True)
     if data.empty:
         raise RuntimeError(f"No se pudo descargar datos para {ticker}")
-    # Yahoo a veces regresa MultiIndex
     if isinstance(data.columns, pd.MultiIndex):
         data.columns = [c[0] for c in data.columns]
-    serie = data["Close"].rename(ticker)
+
+    # Construye el nombre amigable
+    nombre_largo = _nombre_largo_yahoo(ticker)
+    etiqueta = f"{ticker} ({nombre_largo})" if nombre_largo else ticker
+    print(f"     -> {etiqueta}")
+
+    serie = data["Close"].rename(etiqueta)
     serie.index = pd.to_datetime(serie.index)
     return serie
 
@@ -155,6 +178,14 @@ def calcular_metricas(
     sharpe_a = (mean_a - rf_diario) / r_a.std(ddof=1) * np.sqrt(PERIODOS_ANIO) if r_a.std(ddof=1) > 0 else np.nan
     sharpe_b = (mean_b - rf_diario) / r_b.std(ddof=1) * np.sqrt(PERIODOS_ANIO) if r_b.std(ddof=1) > 0 else np.nan
 
+    # --- Sortino (igual que Sharpe pero usa solo volatilidad a la baja) ---
+    downside_a = np.minimum(r_a - rf_diario, 0)
+    downside_b = np.minimum(r_b - rf_diario, 0)
+    dd_dev_a = np.sqrt((downside_a ** 2).mean()) * np.sqrt(PERIODOS_ANIO)
+    dd_dev_b = np.sqrt((downside_b ** 2).mean()) * np.sqrt(PERIODOS_ANIO)
+    sortino_a = (mean_a - rf_diario) * PERIODOS_ANIO / dd_dev_a if dd_dev_a > 0 else np.nan
+    sortino_b = (mean_b - rf_diario) * PERIODOS_ANIO / dd_dev_b if dd_dev_b > 0 else np.nan
+
     # --- Tracking Error (vol del diferencial de retornos, anualizada) ---
     diff = r_a - r_b
     tracking_error = diff.std(ddof=1) * np.sqrt(PERIODOS_ANIO)
@@ -191,6 +222,8 @@ def calcular_metricas(
         "Volatilidad_anual_benchmark": round(vol_b, 4),
         "Sharpe_serie": round(sharpe_a, 4),
         "Sharpe_benchmark": round(sharpe_b, 4),
+        "Sortino_serie": round(sortino_a, 4),
+        "Sortino_benchmark": round(sortino_b, 4),
         "Tracking_Error_anual": round(tracking_error, 4),
         "Information_Ratio": round(info_ratio, 4),
         "Retorno_acumulado_serie": round(nav_a, 4),
@@ -366,7 +399,14 @@ def _interpretar(m: dict) -> dict:
 # 5. GRÁFICO HTML INTERACTIVO
 # ---------------------------------------------------------------------------
 def exportar_html(combinado: pd.DataFrame, resultados: dict, benchmark_col: str, salida: str) -> None:
-    """Genera dashboard HTML interactivo con Plotly."""
+    """Genera dashboard HTML interactivo con Plotly.
+
+    Cambios estéticos:
+      - Leyendas visibles para identificar series en cada gráfico
+      - Colores consistentes en todos los paneles (legendgroup)
+      - Tabla de métricas con DOS columnas (Activo + Benchmark)
+      - Título dinámico: "Análisis Activo A (...) vs Activo B (...)"
+    """
     try:
         import plotly.graph_objects as go
         from plotly.subplots import make_subplots
@@ -378,94 +418,215 @@ def exportar_html(combinado: pd.DataFrame, resultados: dict, benchmark_col: str,
     rets = combinado.pct_change().dropna()
 
     series_user = [c for c in combinado.columns if c != benchmark_col]
-    n_series = len(series_user)
+
+    # Paleta consistente: cada activo mantiene su color en los 6 paneles
+    PALETA = ["#1F4E78", "#C00000", "#00B050", "#7030A0", "#ED7D31", "#2E75B6"]
+    color_de = {c: PALETA[i % len(PALETA)] for i, c in enumerate(combinado.columns)}
+
+    # Título dinámico
+    nombres_serie = ", ".join(series_user)
+    titulo_principal = f"Análisis  Activo A ({nombres_serie})  vs  Activo B ({benchmark_col})"
 
     fig = make_subplots(
         rows=3, cols=2,
         subplot_titles=(
             "Evolución Base 100",
             "Drawdown (%)",
-            "Retornos diarios — dispersión vs benchmark",
+            f"Dispersión retornos diarios — eje X: {benchmark_col}",
             "Volatilidad rolling 60d (anualizada)",
             "Correlación rolling 60d",
             "Beta rolling 60d",
         ),
         specs=[[{}, {}], [{}, {}], [{}, {}]],
-        vertical_spacing=0.10,
+        vertical_spacing=0.12,
         horizontal_spacing=0.10,
     )
 
+    # Cada subplot tiene su propia mini-leyenda (legend1..legend6) anclada
+    # arriba a la derecha del panel correspondiente.
+    LEG_KEY = ["legend", "legend2", "legend3", "legend4", "legend5", "legend6"]
+
     # 1. NAV base 100
     for c in combinado.columns:
-        fig.add_trace(go.Scatter(x=nav.index, y=nav[c], name=c, mode="lines"), row=1, col=1)
+        fig.add_trace(go.Scatter(
+            x=nav.index, y=nav[c], name=c, legendgroup=c, legend=LEG_KEY[0],
+            mode="lines", line=dict(color=color_de[c], width=2),
+        ), row=1, col=1)
 
     # 2. Drawdown
     for c in combinado.columns:
         cum = combinado[c] / combinado[c].iloc[0]
         dd = (cum / cum.cummax() - 1) * 100
-        fig.add_trace(go.Scatter(x=dd.index, y=dd, name=f"DD {c}", mode="lines",
-                                  fill="tozeroy", opacity=0.5, showlegend=False), row=1, col=2)
+        fig.add_trace(go.Scatter(
+            x=dd.index, y=dd, name=c, legendgroup=c, legend=LEG_KEY[1],
+            mode="lines", fill="tozeroy", opacity=0.45,
+            line=dict(color=color_de[c]),
+        ), row=1, col=2)
 
     # 3. Scatter rets serie vs benchmark
     for c in series_user:
-        fig.add_trace(
-            go.Scatter(x=rets[benchmark_col] * 100, y=rets[c] * 100,
-                       mode="markers", name=f"Rets {c}",
-                       marker=dict(size=4, opacity=0.5), showlegend=False),
-            row=2, col=1,
-        )
+        fig.add_trace(go.Scatter(
+            x=rets[benchmark_col] * 100, y=rets[c] * 100,
+            mode="markers", name=c, legendgroup=c, legend=LEG_KEY[2],
+            marker=dict(size=4, opacity=0.55, color=color_de[c]),
+        ), row=2, col=1)
 
     # 4. Volatilidad rolling
     vol = rets.rolling(60).std() * np.sqrt(PERIODOS_ANIO) * 100
     for c in combinado.columns:
-        fig.add_trace(go.Scatter(x=vol.index, y=vol[c], name=f"Vol {c}", mode="lines",
-                                  showlegend=False), row=2, col=2)
+        fig.add_trace(go.Scatter(
+            x=vol.index, y=vol[c], name=c, legendgroup=c, legend=LEG_KEY[3],
+            mode="lines", line=dict(color=color_de[c]),
+        ), row=2, col=2)
 
     # 5. Correlación rolling
     for c in series_user:
         cr = rets[c].rolling(60).corr(rets[benchmark_col])
-        fig.add_trace(go.Scatter(x=cr.index, y=cr, name=f"Corr {c}", mode="lines",
-                                  showlegend=False), row=3, col=1)
+        fig.add_trace(go.Scatter(
+            x=cr.index, y=cr, name=c, legendgroup=c, legend=LEG_KEY[4],
+            mode="lines", line=dict(color=color_de[c]),
+        ), row=3, col=1)
 
     # 6. Beta rolling = Cov/Var en ventana 60d
     for c in series_user:
         cov_r = rets[c].rolling(60).cov(rets[benchmark_col])
         var_r = rets[benchmark_col].rolling(60).var()
         beta_r = cov_r / var_r
-        fig.add_trace(go.Scatter(x=beta_r.index, y=beta_r, name=f"Beta {c}", mode="lines",
-                                  showlegend=False), row=3, col=2)
+        fig.add_trace(go.Scatter(
+            x=beta_r.index, y=beta_r, name=c, legendgroup=c, legend=LEG_KEY[5],
+            mode="lines", line=dict(color=color_de[c]),
+        ), row=3, col=2)
 
+    # Cada leyenda anclada arriba-izquierda, posicionada JUSTO DEBAJO del
+    # subplot correspondiente — queda fuera del área de datos.
+    # Layout 3x2 con vertical_spacing=0.12 → bottom de cada fila:
+    #   fila 1: y ~ 0.745,  fila 2: y ~ 0.370,  fila 3: y ~ 0.000
+    # Col izquierda: x ~ 0.00, col derecha: x ~ 0.55
+    _leg_style = dict(orientation="h", xanchor="left", yanchor="top",
+                      bgcolor="rgba(255,255,255,0)",
+                      bordercolor="rgba(0,0,0,0)", borderwidth=0,
+                      font=dict(size=9, color="#444"))
     fig.update_layout(
-        title=dict(text="Dashboard de análisis técnico vs benchmark", font=dict(size=20)),
-        height=1200,
+        height=1340,
         template="plotly_white",
         hovermode="x unified",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        margin=dict(t=40, b=80, l=60, r=40),
+        # y reducido ~0.02 (≈ 0.5 cm) para separar la leyenda del panel
+        legend=dict( x=0.00, y=0.725, **_leg_style),
+        legend2=dict(x=0.55, y=0.725, **_leg_style),
+        legend3=dict(x=0.00, y=0.350, **_leg_style),
+        legend4=dict(x=0.55, y=0.350, **_leg_style),
+        legend5=dict(x=0.00, y=-0.025, **_leg_style),
+        legend6=dict(x=0.55, y=-0.025, **_leg_style),
     )
-    fig.update_xaxes(title_text="Retorno benchmark (%)", row=2, col=1)
+    fig.update_xaxes(title_text=f"Retorno {benchmark_col} (%)", row=2, col=1)
     fig.update_yaxes(title_text="Retorno serie (%)", row=2, col=1)
+    fig.update_yaxes(title_text="Base 100", row=1, col=1)
+    fig.update_yaxes(title_text="Drawdown (%)", row=1, col=2)
+    fig.update_yaxes(title_text="Vol anual (%)", row=2, col=2)
+    fig.update_yaxes(title_text="Correlación", row=3, col=1)
+    fig.update_yaxes(title_text="Beta", row=3, col=2)
 
-    # Tabla de métricas anexada al HTML
-    tabla_html = "<h2 style='font-family:Arial'>Métricas clave</h2><table style='border-collapse:collapse;font-family:Arial'>"
-    headers = list(next(iter(resultados.values())).keys())
-    tabla_html += "<tr style='background:#1F4E78;color:white'><th style='padding:6px;border:1px solid #ccc'>Métrica</th>"
-    for s in resultados:
-        tabla_html += f"<th style='padding:6px;border:1px solid #ccc'>{s}</th>"
-    tabla_html += "</tr>"
-    for h in headers:
-        tabla_html += f"<tr><td style='padding:6px;border:1px solid #ccc;background:#f2f2f2'><b>{h}</b></td>"
-        for s, m in resultados.items():
-            tabla_html += f"<td style='padding:6px;border:1px solid #ccc;text-align:right'>{m[h]}</td>"
-        tabla_html += "</tr>"
-    tabla_html += "</table>"
+    # =================== Tabla de métricas comparativa ===================
+    def _fmt(v, kind="num"):
+        if v is None:
+            return "-"
+        try:
+            if isinstance(v, float) and pd.isna(v):
+                return "-"
+        except Exception:
+            pass
+        if kind == "pct":
+            try:
+                return f"{float(v)*100:,.2f}%"
+            except Exception:
+                return str(v)
+        if kind == "num":
+            try:
+                return f"{float(v):,.4f}"
+            except Exception:
+                return str(v)
+        if kind == "int":
+            try:
+                return f"{int(v):,}"
+            except Exception:
+                return str(v)
+        return str(v)
+
+    # (etiqueta, key_serie, key_benchmark_o_None, formato)
+    FILAS = [
+        ("Periodo",                     "Periodo_inicio",              "Periodo_fin",                  "periodo"),
+        ("Observaciones",               "Observaciones",               "Observaciones",                "int"),
+        ("Retorno acumulado",           "Retorno_acumulado_serie",     "Retorno_acumulado_benchmark",  "pct"),
+        ("CAGR (anualizado)",           "CAGR_serie",                  "CAGR_benchmark",               "pct"),
+        ("Volatilidad anualizada",      "Volatilidad_anual_serie",     "Volatilidad_anual_benchmark",  "pct"),
+        ("Sharpe Ratio",                "Sharpe_serie",                "Sharpe_benchmark",             "num"),
+        ("Sortino Ratio",               "Sortino_serie",               "Sortino_benchmark",            "num"),
+        ("Max Drawdown",                "Max_Drawdown_serie",          "Max_Drawdown_benchmark",       "pct"),
+        ("Beta vs benchmark",           "Beta",                        None,                           "num"),
+        ("Alpha Jensen (anualizado)",   "Alpha_anual (Jensen)",        None,                           "pct"),
+        ("Correlación (Pearson)",       "Correlacion",                 None,                           "num"),
+        ("R cuadrado",                  "R_cuadrado",                  None,                           "pct"),
+        ("Tracking Error (anualizado)", "Tracking_Error_anual",        None,                           "pct"),
+        ("Information Ratio",           "Information_Ratio",           None,                           "num"),
+    ]
+
+    def _valor_benchmark_trivial(lbl):
+        """Lo que vale la métrica del benchmark cuando se compara contra sí mismo."""
+        if lbl == "Beta vs benchmark":          return "1.0000"
+        if lbl == "Alpha Jensen (anualizado)":  return "0.00%"
+        if lbl == "Correlación (Pearson)":      return "1.0000"
+        if lbl == "R cuadrado":                 return "100.00%"
+        if lbl == "Tracking Error (anualizado)":return "0.00%"
+        if lbl == "Information Ratio":          return "-"
+        return "-"
+
+    tabla_html = "<h2 style='font-family:Arial;color:#1F4E78;margin-top:30px'>Métricas comparativas</h2>"
+
+    for serie_name, m in resultados.items():
+        tabla_html += (
+            "<table style='border-collapse:collapse;font-family:Arial;font-size:13px;"
+            "margin-bottom:24px;border:1px solid #BFBFBF'>"
+        )
+        tabla_html += (
+            "<tr style='background:#1F4E78;color:white'>"
+            "<th style='padding:8px 14px;text-align:left;border:1px solid #1F4E78'>Métrica</th>"
+            f"<th style='padding:8px 14px;text-align:center;border:1px solid #1F4E78'>"
+            f"Activo A: {serie_name}</th>"
+            f"<th style='padding:8px 14px;text-align:center;border:1px solid #1F4E78'>"
+            f"Activo B: {benchmark_col}</th>"
+            "</tr>"
+        )
+        for lbl, key_a, key_b, fmt in FILAS:
+            if fmt == "periodo":
+                v_a_str = f"{m.get(key_a,'')} → {m.get(key_b,'')}"
+                v_b_str = v_a_str
+            elif key_b is None:
+                v_a_str = _fmt(m.get(key_a), fmt)
+                v_b_str = _valor_benchmark_trivial(lbl)
+            else:
+                v_a_str = _fmt(m.get(key_a), fmt)
+                v_b_str = _fmt(m.get(key_b), fmt)
+            tabla_html += (
+                "<tr>"
+                f"<td style='padding:6px 14px;background:#F2F2F2;font-weight:bold;"
+                "border-bottom:1px solid #E0E0E0'>" + lbl + "</td>"
+                "<td style='padding:6px 14px;text-align:center;background:#E2EFDA;"
+                "border-bottom:1px solid #E0E0E0'>" + v_a_str + "</td>"
+                "<td style='padding:6px 14px;text-align:center;"
+                "border-bottom:1px solid #E0E0E0'>" + v_b_str + "</td>"
+                "</tr>"
+            )
+        tabla_html += "</table>"
 
     html_chart = fig.to_html(include_plotlyjs="cdn", full_html=False)
     full = f"""<!doctype html><html><head><meta charset='utf-8'>
-<title>Análisis vs S&P 500</title></head><body style='font-family:Arial;margin:20px'>
-<h1>Análisis técnico de series vs benchmark</h1>
+<title>{titulo_principal}</title></head>
+<body style='font-family:Arial;margin:20px;color:#222'>
+<h1 style='color:#1F4E78;margin-bottom:4px'>{titulo_principal}</h1>
+<p style='color:#888;font-size:12px;margin-top:0'>Generado el {datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
 {html_chart}
 {tabla_html}
-<p style='color:#888;font-size:11px'>Generado el {datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
 </body></html>"""
 
     with open(salida, "w", encoding="utf-8") as f:
